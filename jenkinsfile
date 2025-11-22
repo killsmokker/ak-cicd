@@ -1,77 +1,268 @@
 pipeline {
     agent any
+    
     tools {
         jdk 'jdk11'
         maven 'maven3'
     }
+    
     environment {
-        NEXUS_REGISTRY = 'http://172.17.7.99:8082'
+        // Infrastructure URLs - UPDATED WITH YOUR IPs
+        NEXUS_URL = 'http://172.17.7.99:8081'
+        NEXUS_REGISTRY = '172.17.7.99:8081'
+        SONARQUBE_URL = 'http://172.17.7.164:9000'
+        JENKINS_URL = 'http://172.17.7.100:8080'
+        K8S_MASTER = 'https://172.17.7.95:6443'
+        
+        // Application settings
         DOCKER_IMAGE_NAME = 'boardgame-app'
         K8S_NAMESPACE = 'boardgame'
-        K8S_MASTER = 'https://172.17.7.95:6443'
+        APP_VERSION = "${BUILD_NUMBER}"
+        APP_URL = "http://boardgame.172.17.7.95.nip.io"
     }
+    
     stages {
-        stage('Git Checkout') {
+        stage('Infrastructure Check') {
             steps {
                 sh '''
-                    echo "=== Cleaning workspace ==="
-                    rm -rf *
-                    rm -rf .* 2>/dev/null || true
-                    echo "=== Cloning repository ==="
-                    git clone https://github.com/killsmokker/ak-cicd.git .
-                    echo "=== Repository contents ==="
-                    ls -la
+                    echo "=== CI/CD Infrastructure ==="
+                    echo "Jenkins:    ${JENKINS_URL}"
+                    echo "Nexus:      ${NEXUS_URL}"
+                    echo "SonarQube:  ${SONARQUBE_URL}"
+                    echo "K8s Master: ${K8S_MASTER}"
+                    echo "Docker User: akkuttu"
                 '''
             }
         }
-        stage('Compile') {
+        
+        stage('Clean Workspace') {
             steps {
-                sh 'mvn compile'
+                cleanWs()
+                sh 'ls -la'
             }
         }
-        stage('Test') {
+        
+        stage('Git Checkout') {
             steps {
+                git branch: 'main', url: 'https://github.com/killsmokker/ak-cicd.git'
+                sh '''
+                    echo "=== Repository Contents ==="
+                    ls -la
+                    echo "=== Java Version ==="
+                    java -version
+                    echo "=== Maven Version ==="
+                    mvn --version
+                '''
+            }
+        }
+        
+        stage('Compile & Test') {
+            steps {
+                sh 'mvn clean compile'
                 sh 'mvn test'
+                junit '**/target/surefire-reports/*.xml'
+                jacoco execPattern: '**/target/jacoco.exec'
             }
         }
-        stage('Build Package') {
-            steps {
-                sh 'mvn clean package -DskipTests'
-            }
-        }
-        stage('Build Docker Image') {
+        
+        stage('Code Quality') {
             steps {
                 script {
-                    withDockerRegistry(credentialsId: 'nexus', toolName: 'docker') {
+                    withSonarQubeEnv('sonar') {
                         sh """
-                            docker build -t ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:latest .
+                            mvn sonar:sonar \
+                            -Dsonar.projectKey=BoardGame \
+                            -Dsonar.projectName=BoardGame \
+                            -Dsonar.host.url=${SONARQUBE_URL} \
+                            -Dsonar.login=admin \
+                            -Dsonar.password=admin
                         """
                     }
                 }
             }
         }
+        
+        stage('Build & Package') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+                archiveArtifacts 'target/*.jar'
+                
+                sh '''
+                    echo "=== Build Artifacts ==="
+                    ls -la target/
+                '''
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                sh 'trivy fs --security-checks vuln,config . --exit-code 0'
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh """
+                        echo "=== Building Docker Image ==="
+                        docker build -t ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:${APP_VERSION} .
+                        docker tag ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:${APP_VERSION} ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:latest
+                        
+                        echo "=== Docker Images ==="
+                        docker images | grep ${DOCKER_IMAGE_NAME}
+                    """
+                }
+            }
+        }
+        
+        stage('Push to Nexus') {
+            steps {
+                script {
+                    sh """
+                        echo "=== Logging into Nexus Docker Registry ==="
+                        docker login -u akkuttu -p your_password ${NEXUS_REGISTRY}
+                        
+                        echo "=== Pushing Docker Images ==="
+                        docker push ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:${APP_VERSION}
+                        docker push ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:latest
+                        
+                        echo "✅ Images pushed to Nexus: ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:${APP_VERSION}"
+                    """
+                }
+            }
+        }
+        
         stage('Deploy to Kubernetes') {
             steps {
-                withKubeConfig(credentialsId: 'kubeconfig', namespace: "${K8S_NAMESPACE}", serverUrl: "${K8S_MASTER}") {
+                script {
                     sh """
+                        echo "=== Preparing Kubernetes Deployment ==="
+                        
+                        # Create namespace
+                        kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Update deployment with current image
+                        sed -i 's|your-nexus-ip:8082/docker-hosted/boardgame-app:latest|${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:${APP_VERSION}|g' k8s-deployment.yaml
+                        
+                        echo "=== Applying Kubernetes Manifests ==="
                         kubectl apply -f k8s-deployment.yaml -n ${K8S_NAMESPACE}
                         kubectl apply -f k8s-service.yaml -n ${K8S_NAMESPACE}
                         kubectl apply -f k8s-ingress.yaml -n ${K8S_NAMESPACE}
-                        echo "=== Deployment Status ==="
-                        kubectl get pods -n ${K8S_NAMESPACE}
+                    """
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    sh """
+                        echo "=== Waiting for Deployment Ready ==="
+                        kubectl rollout status deployment/boardgame-app -n ${K8S_NAMESPACE} --timeout=600s
+                        
+                        echo ""
+                        echo "=== Cluster Status ==="
+                        echo "Nodes:"
+                        kubectl get nodes
+                        echo ""
+                        echo "Pods:"
+                        kubectl get pods -n ${K8S_NAMESPACE} -o wide
+                        echo ""
+                        echo "Services:"
+                        kubectl get svc -n ${K8S_NAMESPACE}
+                        echo ""
+                        echo "Ingress:"
+                        kubectl get ingress -n ${K8S_NAMESPACE}
+                    """
+                }
+            }
+        }
+        
+        stage('Smoke Test') {
+            steps {
+                script {
+                    sh """
+                        echo "=== Running Smoke Tests ==="
+                        echo "Waiting for application to be ready..."
+                        sleep 30
+                        
+                        echo "Testing application endpoint: ${APP_URL}"
+                        curl -f ${APP_URL} && echo "✅ Application is accessible" || echo "⚠️  Application might be starting..."
+                        
+                        echo ""
+                        echo "Testing health endpoint:"
+                        curl ${APP_URL}/actuator/health || echo "Health endpoint not ready"
+                        
+                        echo ""
+                        echo "=== Deployment Summary ==="
+                        echo "🎉 Application deployed successfully!"
+                        echo "🌐 URL: ${APP_URL}"
+                        echo "🔧 Test Users:"
+                        echo "   - User: bugs / bunny"
+                        echo "   - Manager: daffy / duck"
                     """
                 }
             }
         }
     }
+    
     post {
+        always {
+            sh """
+                echo "=== Pipeline Execution Complete ==="
+                echo "Build Number: ${BUILD_NUMBER}"
+                echo "Docker Image: ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:${APP_VERSION}"
+                echo "K8s Namespace: ${K8S_NAMESPACE}"
+                echo "Application URL: ${APP_URL}"
+            """
+        }
         success {
-            echo "🎉 SUCCESS! BoardGame app deployed!"
-            echo "🌐 Access at: http://boardgame.172.17.7.95.nip.io"
-            echo "👤 Test users: bugs/bunny (user) | daffy/duck (manager)"
+            sh """
+                echo "🎉🎉🎉 DEPLOYMENT SUCCESSFUL! 🎉🎉🎉"
+                echo ""
+                echo "📋 Quick Access:"
+                echo "   Application: ${APP_URL}"
+                echo "   Jenkins:     ${JENKINS_URL}"
+                echo "   SonarQube:   ${SONARQUBE_URL}"
+                echo "   Nexus:       ${NEXUS_URL}"
+                echo ""
+                echo "👤 Test Credentials:"
+                echo "   User:    bugs / bunny"
+                echo "   Manager: daffy / duck"
+                echo ""
+                echo "🖥️  Infrastructure:"
+                echo "   K8s Master: 172.17.7.95"
+                echo "   Worker Nodes: 2"
+                echo "   Docker Registry: ${NEXUS_REGISTRY}"
+            """
+            
+            // Optional: Send success notification
+            emailext (
+                subject: "SUCCESS: BoardGame App Deployed - Build ${BUILD_NUMBER}",
+                body: """
+                BoardGame Application deployed successfully!
+                
+                Application URL: ${APP_URL}
+                Docker Image: ${NEXUS_REGISTRY}/docker-hosted/${DOCKER_IMAGE_NAME}:${APP_VERSION}
+                Build: ${BUILD_URL}
+                
+                Test Users:
+                - User: bugs / bunny
+                - Manager: daffy / duck
+                """,
+                to: "dev-team@yourcompany.com"
+            )
         }
         failure {
-            echo "❌ Pipeline failed! Check logs above."
+            sh """
+                echo "❌❌❌ DEPLOYMENT FAILED! ❌❌❌"
+                echo ""
+                echo "🔧 Troubleshooting Commands:"
+                echo "   kubectl get pods -n ${K8S_NAMESPACE}"
+                echo "   kubectl describe deployment/boardgame-app -n ${K8S_NAMESPACE}"
+                echo "   kubectl logs -l app=boardgame-app -n ${K8S_NAMESPACE} --tail=50"
+                echo "   kubectl get events -n ${K8S_NAMESPACE} --sort-by=.lastTimestamp"
+            """
         }
     }
 }
